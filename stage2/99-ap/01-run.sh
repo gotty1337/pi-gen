@@ -43,9 +43,8 @@ echo "enable_uart=1" >> \
 echo "dtoverlay=dwc2,dr_mode=peripheral" >> \
     "${ROOTFS_DIR}/boot/firmware/config.txt" 
 
-# Enable dwc2 kernel module during boot
-sed -i \
-    's/$/ modules-load=dwc2/' \
+# Enable dwc2 kernel module during boot (append only to non-empty lines, once)
+sed -i '/^[^#]/ s/$/ modules-load=dwc2/' \
     "${ROOTFS_DIR}/boot/firmware/cmdline.txt"
 
 touch "${ROOTFS_DIR}/boot/firmware/ssh"
@@ -61,6 +60,4 @@ systemctl enable ssh
 systemctl enable systemd-networkd
 
 systemctl mask wpa_supplicant.service || true
-
-rfkill unblock wlan || true
 EOF
