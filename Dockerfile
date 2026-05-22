@@ -31,6 +31,7 @@ RUN apt-get update && \
         ca-certificates \
         fdisk \
         gpg \
+        debian-archive-keyring \
         pigz \
         arch-test \
     && rm -rf /var/lib/apt/lists/*
