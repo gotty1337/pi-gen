@@ -1,0 +1,55 @@
+#!/bin/bash
+set -e
+
+ROOTFS_DIR="${ROOTFS_DIR}"
+
+echo "Installing AP configuration..."
+
+install -m 644 files/hostapd.conf \
+    "${ROOTFS_DIR}/etc/hostapd/hostapd.conf"
+
+install -m 644 files/dnsmasq.conf \
+    "${ROOTFS_DIR}/etc/dnsmasq.conf"
+
+cat <<EOF >> "${ROOTFS_DIR}/etc/dhcpcd.conf"
+
+interface wlan0
+    static ip_address=192.168.4.1/24
+    nohook wpa_supplicant
+EOF
+
+sed -i \
+'s|#DAEMON_CONF=""|DAEMON_CONF="/etc/hostapd/hostapd.conf"|' \
+"${ROOTFS_DIR}/etc/default/hostapd"
+
+echo "net.ipv4.ip_forward=1" >> \
+"${ROOTFS_DIR}/etc/sysctl.conf"
+
+# Enable UART
+echo "enable_uart=1" >> \
+    "${ROOTFS_DIR}/boot/firmware/config.txt"
+
+# Enable USB device mode
+echo "dtoverlay=dwc2,dr_mode=peripheral" >> \
+    "${ROOTFS_DIR}/boot/firmware/config.txt" 
+
+# Enable dwc2 kernel module during boot
+sed -i \
+    's/$/ modules-load=dwc2/' \
+    "${ROOTFS_DIR}/boot/firmware/cmdline.txt"
+
+touch "${ROOTFS_DIR}/boot/firmware/ssh"
+
+echo "country=AT" > \
+   "${ROOTFS_DIR}/etc/wpa_supplicant/wpa_supplicant.conf"
+
+on_chroot << EOF
+systemctl unmask hostapd
+systemctl enable hostapd
+systemctl enable dnsmasq
+systemctl enable ssh
+
+systemctl mask wpa_supplicant.service || true
+
+rfkill unblock wlan || true
+EOF
