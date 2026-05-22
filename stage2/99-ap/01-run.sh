@@ -11,11 +11,21 @@ install -m 644 files/hostapd.conf \
 install -m 644 files/dnsmasq.conf \
     "${ROOTFS_DIR}/etc/dnsmasq.conf"
 
-cat <<EOF >> "${ROOTFS_DIR}/etc/dhcpcd.conf"
+# Tell NetworkManager to leave wlan0 alone so hostapd can manage it
+install -v -m 644 /dev/stdin \
+    "${ROOTFS_DIR}/etc/NetworkManager/conf.d/99-unmanaged-wlan0.conf" <<EOF
+[keyfile]
+unmanaged-devices=interface-name:wlan0
+EOF
 
-interface wlan0
-    static ip_address=192.168.4.1/24
-    nohook wpa_supplicant
+# Set static IP on wlan0 via systemd-networkd
+install -v -m 644 /dev/stdin \
+    "${ROOTFS_DIR}/etc/systemd/network/10-wlan0-ap.network" <<EOF
+[Match]
+Name=wlan0
+
+[Network]
+Address=192.168.4.1/24
 EOF
 
 sed -i \
@@ -48,6 +58,7 @@ systemctl unmask hostapd
 systemctl enable hostapd
 systemctl enable dnsmasq
 systemctl enable ssh
+systemctl enable systemd-networkd
 
 systemctl mask wpa_supplicant.service || true
 
