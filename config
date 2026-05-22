@@ -1,0 +1,10 @@
+IMG_NAME='pizero2w-ap'
+TARGET_HOSTNAME='pizero2wap'
+
+FIRST_USER_NAME='pi'
+FIRST_USER_PASS='raspberry'
+DISABLE_FIRST_BOOT_USER_RENAME=1
+
+ENABLE_SSH=1
+
+STAGE_LIST="stage0 stage1 stage2"
