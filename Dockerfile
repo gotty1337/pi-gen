@@ -40,6 +40,8 @@ RUN git config --global --add safe.directory /pi-gen
 
 COPY . /pi-gen/
 
+RUN find /pi-gen -name "*.sh" -exec chmod +x {} +
+
 WORKDIR /pi-gen
 
 VOLUME ["/pi-gen/work", "/pi-gen/deploy"]
