@@ -1,0 +1,9 @@
+# Visual Studio
+.vs/
+
+# .NET build output
+bin/
+obj/
+
+# Published output (built on-device, not committed)
+files/ipp_printer_publish/

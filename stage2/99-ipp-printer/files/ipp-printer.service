@@ -1,0 +1,17 @@
+[Unit]
+Description=IPP-over-USB Printer Gadget
+After=local-fs.target
+DefaultDependencies=no
+
+[Service]
+Type=forking
+PIDFile=/run/ipp-printer.pid
+Environment=DOTNET_ROOT=/usr/share/dotnet
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/share/dotnet
+ExecStart=/home/pi/ipp-printer/setup_gadget.sh
+ExecStop=/home/pi/ipp-printer/teardown_gadget.sh
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
