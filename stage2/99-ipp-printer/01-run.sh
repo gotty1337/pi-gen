@@ -26,6 +26,10 @@ install -v -m 755 files/setup_gadget.sh     "${ROOTFS_DIR}/home/pi/ipp-printer/"
 install -v -m 755 files/teardown_gadget.sh  "${ROOTFS_DIR}/home/pi/ipp-printer/"
 install -v -m 644 files/ipp-printer.service "${ROOTFS_DIR}/etc/systemd/system/"
 
+# Strip Windows CRLF line endings (files edited on Windows may have \r\n)
+sed -i 's/\r$//' "${ROOTFS_DIR}/home/pi/ipp-printer/setup_gadget.sh"
+sed -i 's/\r$//' "${ROOTFS_DIR}/home/pi/ipp-printer/teardown_gadget.sh"
+
 # ── Deploy C# source (the Pi builds the binary at service start) ──────────────
 install -v -d "${ROOTFS_DIR}/home/pi/ipp-printer/src/IppPrinter"
 install -v -m 644 src/IppPrinter/IppPrinter.csproj "${ROOTFS_DIR}/home/pi/ipp-printer/src/IppPrinter/"
