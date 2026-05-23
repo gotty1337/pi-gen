@@ -1,0 +1,2 @@
+otty1337@apollo13-rpi4:~/source/repos/pi-gen $ docker build -t pi-gen:latest .
+docker run --rm -it  --privileged -v /home/gotty1337/source/repos/pi-gen:/pi-gen -v /home/gotty1337/pi-gen-work:/pi-gen/work -v /home/gotty1337/pi-gen-deploy:/pi-gen/deploy pi-gen:latest ./build.sh
