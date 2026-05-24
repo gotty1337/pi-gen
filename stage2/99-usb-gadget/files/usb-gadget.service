@@ -1,0 +1,27 @@
+[Unit]
+Description=USB FunctionFS Bulk Loopback Gadget
+After=local-fs.target
+
+[Service]
+Type=simple
+
+# 1. (Re)build the daemon binary if the source is newer or binary is missing.
+ExecStartPre=/usr/local/sbin/gadget_build.sh
+
+# 2. Set up configfs gadget structure and mount FunctionFS.
+ExecStartPre=/usr/local/sbin/gadget_setup.sh
+
+# 3. Start the userspace daemon (writes USB descriptors to ep0).
+ExecStart=/usr/local/sbin/usb_gadget /dev/ffs-loopback
+
+# 4. Once the daemon is ready, bind to the UDC so the host can enumerate.
+ExecStartPost=/usr/local/sbin/gadget_enable.sh
+
+# 5. On stop, detach from UDC and remove configfs entries.
+ExecStopPost=/usr/local/sbin/gadget_teardown.sh
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
