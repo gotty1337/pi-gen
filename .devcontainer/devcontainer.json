@@ -1,0 +1,27 @@
+{
+    "name": "pi-gen USB Gadget Dev",
+    "build": {
+        "dockerfile": "Dockerfile",
+        "context": "..",
+        "cacheFrom": "pi-gen-usb-gadget:latest"
+    },
+    "workspaceFolder": "/workspaces/pi-gen",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-vscode.cpptools",
+                "ms-vscode.cpptools-themes",
+                "ms-vscode.makefile-tools"
+            ],
+            "settings": {
+                "C_Cpp.default.compilerPath": "/usr/bin/aarch64-linux-gnu-gcc",
+                "C_Cpp.default.intelliSenseMode": "linux-gcc-arm64",
+                "C_Cpp.default.includePath": [
+                    "/usr/include",
+                    "${workspaceFolder}/stage2/99-usb-gadget/files"
+                ]
+            }
+        }
+    },
+    "postCreateCommand": "make -C stage2/99-usb-gadget all"
+}
