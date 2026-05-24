@@ -18,6 +18,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gdb \
     file \
     ca-certificates \
+    # Vim + plugins bootstrap
+    vim \
+    curl \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
+# Install vim-plug
+RUN curl -fLo /root/.vim/autoload/plug.vim --create-dirs \
+    https://raw.githubusercontent.com/junegunn/vim-plug/master/plug.vim
+
+# Write vimrc
+COPY .devcontainer/vimrc /root/.vimrc
+
+# Install plugins non-interactively
+RUN vim -E -s -u /root/.vimrc +PlugInstall +qall || true
+
 WORKDIR /workspace
+
