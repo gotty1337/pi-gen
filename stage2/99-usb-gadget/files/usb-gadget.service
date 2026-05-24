@@ -1,0 +1,28 @@
+[Unit]
+Description=USB FunctionFS Bulk Loopback Gadget
+After=local-fs.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/pi/usb-gadget
+
+# 1. (Re)build the daemon binary if source is newer or binary is missing.
+ExecStartPre=/home/pi/usb-gadget/gadget_build.sh
+
+# 2. Set up configfs gadget structure and mount FunctionFS.
+ExecStartPre=/home/pi/usb-gadget/gadget_setup.sh
+
+# 3. Start the daemon (writes USB descriptors to ep0).
+ExecStart=/home/pi/usb-gadget/usb_gadget /dev/ffs-loopback
+
+# 4. Once the daemon has written descriptors, bind to the UDC.
+ExecStartPost=/home/pi/usb-gadget/gadget_enable.sh
+
+# 5. On stop, detach UDC and clean up configfs.
+ExecStopPost=/home/pi/usb-gadget/gadget_teardown.sh
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
