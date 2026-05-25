@@ -36,6 +36,15 @@ fi
 
 on_chroot << 'EOF'
 chown -R pi:pi /home/pi/usb-gadget
+
+# Install CUPS packages with a policy-rc.d that blocks service operations
+# in the chroot, preventing the postinst scripts from trying (and failing)
+# to start/reload cupsd.
+printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
+chmod +x /usr/sbin/policy-rc.d
+apt-get install -y cups printer-driver-cups-pdf
+rm -f /usr/sbin/policy-rc.d
+
 systemctl enable usb-gadget.service
 systemctl enable cups.service
 systemctl enable cups-printer-setup.service
