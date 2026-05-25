@@ -29,10 +29,13 @@ RUN curl -fLo /root/.vim/autoload/plug.vim --create-dirs \
     https://raw.githubusercontent.com/junegunn/vim-plug/master/plug.vim
 
 # Write vimrc
-COPY .devcontainer/vimrc /root/.vimrc
+COPY vimrc /root/.vimrc
+
+# Copy pi-gen folder
+COPY --chmod=755 . /pi-gen/
 
 # Install plugins non-interactively
 RUN vim -E -s -u /root/.vimrc +PlugInstall +qall || true
 
-WORKDIR /workspace
+WORKDIR /pi-gen/
 
