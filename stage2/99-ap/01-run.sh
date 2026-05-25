@@ -39,13 +39,20 @@ echo "net.ipv4.ip_forward=1" >> \
 echo "enable_uart=1" >> \
     "${ROOTFS_DIR}/boot/firmware/config.txt"
 
-# Enable USB device mode
-echo "dtoverlay=dwc2,dr_mode=peripheral" >> \
-    "${ROOTFS_DIR}/boot/firmware/config.txt" 
+# Enable USB device mode (idempotent)
+if ! grep -qF 'dtoverlay=dwc2,dr_mode=peripheral' \
+        "${ROOTFS_DIR}/boot/firmware/config.txt"; then
+    echo "dtoverlay=dwc2,dr_mode=peripheral" >> \
+        "${ROOTFS_DIR}/boot/firmware/config.txt"
+fi
 
-# Enable dwc2 kernel module during boot (append only to non-empty lines, once)
-sed -i '/^[^#]/ s/$/ modules-load=dwc2/' \
-    "${ROOTFS_DIR}/boot/firmware/cmdline.txt"
+# Enable dwc2 kernel module during boot (idempotent – append once to the
+# single non-comment line that makes up cmdline.txt)
+if ! grep -qE '(^| )modules-load=[^ ]*dwc2' \
+        "${ROOTFS_DIR}/boot/firmware/cmdline.txt"; then
+    sed -i '/^[^#]/ s/$/ modules-load=dwc2/' \
+        "${ROOTFS_DIR}/boot/firmware/cmdline.txt"
+fi
 
 touch "${ROOTFS_DIR}/boot/firmware/ssh"
 

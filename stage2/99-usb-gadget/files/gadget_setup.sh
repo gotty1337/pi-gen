@@ -24,9 +24,18 @@ fi
 mkdir -p "${GADGET}"
 echo 0x1d6b > "${GADGET}/idVendor"   # Linux Foundation
 echo 0x0104 > "${GADGET}/idProduct"  # Multifunction Composite Gadget
+echo 0x0200 > "${GADGET}/bcdUSB"     # USB 2.0
+echo 0x00   > "${GADGET}/bDeviceClass"    # Class defined at interface level
+echo 0x00   > "${GADGET}/bDeviceSubClass"
+echo 0x00   > "${GADGET}/bDeviceProtocol"
+
+# Use the SoC CPU serial as the USB serial number so each device is unique.
+# Falls back to a fixed string if the serial is unavailable.
+SERIAL=$(awk '/^Serial/ {print $3}' /proc/cpuinfo 2>/dev/null | tr -d '[:space:]')
+SERIAL="${SERIAL:-deadbeef00000000}"
 
 mkdir -p "${GADGET}/strings/0x409"
-echo "1234567890"        > "${GADGET}/strings/0x409/serialnumber"
+echo "${SERIAL}"         > "${GADGET}/strings/0x409/serialnumber"
 echo "Raspberry Pi"      > "${GADGET}/strings/0x409/manufacturer"
 echo "USB Bulk Loopback" > "${GADGET}/strings/0x409/product"
 
