@@ -1,2 +1,5 @@
 gcc
 make
+cups
+cups-pdf
+printer-driver-cups-pdf

@@ -37,12 +37,12 @@ SERIAL="${SERIAL:-deadbeef00000000}"
 mkdir -p "${GADGET}/strings/0x409"
 echo "${SERIAL}"         > "${GADGET}/strings/0x409/serialnumber"
 echo "Raspberry Pi"      > "${GADGET}/strings/0x409/manufacturer"
-echo "USB Bulk Loopback" > "${GADGET}/strings/0x409/product"
+echo "USB IPP Printer" > "${GADGET}/strings/0x409/product"
 
 mkdir -p "${GADGET}/configs/c.1"
 echo 250 > "${GADGET}/configs/c.1/MaxPower"
 mkdir -p "${GADGET}/configs/c.1/strings/0x409"
-echo "Loopback config" > "${GADGET}/configs/c.1/strings/0x409/configuration"
+echo "IPP Printer config" > "${GADGET}/configs/c.1/strings/0x409/configuration"
 
 mkdir -p "${GADGET}/functions/ffs.usb0"
 
