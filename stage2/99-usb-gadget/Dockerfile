@@ -32,10 +32,10 @@ RUN curl -fLo /root/.vim/autoload/plug.vim --create-dirs \
 COPY vimrc /root/.vimrc
 
 # Copy pi-gen folder
-COPY --chmod=755 . /pi-gen/
+COPY --chmod=755 files /usb-gadget
 
 # Install plugins non-interactively
 RUN vim -E -s -u /root/.vimrc +PlugInstall +qall || true
 
-WORKDIR /pi-gen/
+WORKDIR /usb-gadget/
 
