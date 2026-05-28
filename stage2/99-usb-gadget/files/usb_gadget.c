@@ -25,11 +25,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <netdb.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
 #include <linux/usb/functionfs.h>
 #include <linux/usb/ch9.h>
+#include <cups/cups.h>
+#include <cups/ipp.h>
 
 /*
  * htole16/32 from <endian.h> are glibc inline functions and are not
@@ -73,26 +77,41 @@ struct ep_desc {
 /* Protocol 0x04 = IPP over USB (triggers Windows driverless driver)  */
 /* ------------------------------------------------------------------ */
 
+/*
+ * ipp-usb requires >= 2 IPP-over-USB interfaces per device (it uses one
+ * for the forward channel and one for the reverse/status channel).
+ * We expose two identical Printer class interfaces (both class=0x07,
+ * subclass=0x01, protocol=0x04) each with their own IN+OUT endpoint pair.
+ */
 static const struct {
     struct usb_functionfs_descs_head_v2 head;
     __le32 fs_count;
     __le32 hs_count;
-    struct usb_interface_descriptor fs_intf;
-    struct ep_desc                  fs_in;
-    struct ep_desc                  fs_out;
-    struct usb_interface_descriptor hs_intf;
-    struct ep_desc                  hs_in;
-    struct ep_desc                  hs_out;
+    /* Full-speed */
+    struct usb_interface_descriptor fs_intf0;
+    struct ep_desc                  fs_in0;
+    struct ep_desc                  fs_out0;
+    struct usb_interface_descriptor fs_intf1;
+    struct ep_desc                  fs_in1;
+    struct ep_desc                  fs_out1;
+    /* High-speed */
+    struct usb_interface_descriptor hs_intf0;
+    struct ep_desc                  hs_in0;
+    struct ep_desc                  hs_out0;
+    struct usb_interface_descriptor hs_intf1;
+    struct ep_desc                  hs_in1;
+    struct ep_desc                  hs_out1;
 } __attribute__((packed)) descriptors = {
     .head = {
         .magic  = LE32(FUNCTIONFS_DESCRIPTORS_MAGIC_V2),
         .length = LE32(sizeof(descriptors)),
         .flags  = LE32(FUNCTIONFS_HAS_FS_DESC | FUNCTIONFS_HAS_HS_DESC),
     },
-    .fs_count = LE32(3),
-    .hs_count = LE32(3),
+    .fs_count = LE32(6),  /* 2 interfaces + 4 endpoints */
+    .hs_count = LE32(6),
 
-    .fs_intf = {
+    /* Interface 0 – forward channel (print jobs) */
+    .fs_intf0 = {
         .bLength            = USB_DT_INTERFACE_SIZE,
         .bDescriptorType    = USB_DT_INTERFACE,
         .bInterfaceNumber   = 0,
@@ -102,21 +121,49 @@ static const struct {
         .bInterfaceProtocol = 0x04,           /* IPP over USB */
         .iInterface         = 1,
     },
-    .fs_in  = EP_DESC(USB_DIR_IN  | 1, USB_ENDPOINT_XFER_BULK,  64),
-    .fs_out = EP_DESC(USB_DIR_OUT | 2, USB_ENDPOINT_XFER_BULK,  64),
+    .fs_in0  = EP_DESC(USB_DIR_IN  | 1, USB_ENDPOINT_XFER_BULK,  64),
+    .fs_out0 = EP_DESC(USB_DIR_OUT | 2, USB_ENDPOINT_XFER_BULK,  64),
 
-    .hs_intf = {
+    /* Interface 1 – reverse channel (status / scan queries) */
+    .fs_intf1 = {
+        .bLength            = USB_DT_INTERFACE_SIZE,
+        .bDescriptorType    = USB_DT_INTERFACE,
+        .bInterfaceNumber   = 1,
+        .bNumEndpoints      = 2,
+        .bInterfaceClass    = USB_CLASS_PRINTER,
+        .bInterfaceSubClass = 0x01,
+        .bInterfaceProtocol = 0x04,
+        .iInterface         = 1,
+    },
+    .fs_in1  = EP_DESC(USB_DIR_IN  | 3, USB_ENDPOINT_XFER_BULK,  64),
+    .fs_out1 = EP_DESC(USB_DIR_OUT | 4, USB_ENDPOINT_XFER_BULK,  64),
+
+    /* High-speed mirrors */
+    .hs_intf0 = {
         .bLength            = USB_DT_INTERFACE_SIZE,
         .bDescriptorType    = USB_DT_INTERFACE,
         .bInterfaceNumber   = 0,
         .bNumEndpoints      = 2,
         .bInterfaceClass    = USB_CLASS_PRINTER,
-        .bInterfaceSubClass = 0x01,           /* Printer */
-        .bInterfaceProtocol = 0x04,           /* IPP over USB */
+        .bInterfaceSubClass = 0x01,
+        .bInterfaceProtocol = 0x04,
         .iInterface         = 1,
     },
-    .hs_in  = EP_DESC(USB_DIR_IN  | 1, USB_ENDPOINT_XFER_BULK, 512),
-    .hs_out = EP_DESC(USB_DIR_OUT | 2, USB_ENDPOINT_XFER_BULK, 512),
+    .hs_in0  = EP_DESC(USB_DIR_IN  | 1, USB_ENDPOINT_XFER_BULK, 512),
+    .hs_out0 = EP_DESC(USB_DIR_OUT | 2, USB_ENDPOINT_XFER_BULK, 512),
+
+    .hs_intf1 = {
+        .bLength            = USB_DT_INTERFACE_SIZE,
+        .bDescriptorType    = USB_DT_INTERFACE,
+        .bInterfaceNumber   = 1,
+        .bNumEndpoints      = 2,
+        .bInterfaceClass    = USB_CLASS_PRINTER,
+        .bInterfaceSubClass = 0x01,
+        .bInterfaceProtocol = 0x04,
+        .iInterface         = 1,
+    },
+    .hs_in1  = EP_DESC(USB_DIR_IN  | 3, USB_ENDPOINT_XFER_BULK, 512),
+    .hs_out1 = EP_DESC(USB_DIR_OUT | 4, USB_ENDPOINT_XFER_BULK, 512),
 };
 
 /* ------------------------------------------------------------------ */
@@ -148,9 +195,10 @@ static const struct {
 /* Globals                                                             */
 /* ------------------------------------------------------------------ */
 
-#define BULK_BUF_SIZE    65536
 #define FFS_DEFAULT      "/dev/ffs-loopback"
 #define CUPS_SOCKET      "/run/cups/cups.sock"
+#define HDR_BUF_MAX      4096
+#define BULK_BUF_SIZE    8192
 
 /*
  * IEEE 1284 Device ID string.  CMD:IPP is what triggers Windows' built-in
@@ -161,66 +209,26 @@ static const struct {
     "CLS:PRINTER;DRV:DRVLESS;"
 
 static volatile sig_atomic_t running = 1;
-static int cups_fd = -1;
 
 static void on_signal(int sig)
 {
     (void)sig;
     running = 0;
-}
+} 
 
 /* ------------------------------------------------------------------ */
-/* CUPS socket helpers                                                 */
+/* Read from a bulk OUT endpoint and log the data.                    */
 /* ------------------------------------------------------------------ */
-
-static void cups_close(void)
+static void read_ep(int ep_out, int iface)
 {
-    if (cups_fd >= 0) {
-        close(cups_fd);
-        cups_fd = -1;
+    static char buf[BULK_BUF_SIZE];
+    ssize_t n = read(ep_out, buf, sizeof(buf) - 1);
+    while (n > 0 && running)
+    {
+        n = read(ep_out, buf, sizeof(buf) - 1);
+        fprintf(stderr, "gadget: [if%d] %zd bytes:\n%s\n", iface, n, buf);
+        memset(buf, 0, sizeof(buf));
     }
-}
-
-static int cups_connect(void)
-{
-    if (cups_fd >= 0)
-        return 0;
-
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, CUPS_SOCKET, sizeof(addr.sun_path) - 1);
-
-    cups_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (cups_fd < 0) {
-        perror("cups socket");
-        return -1;
-    }
-
-    if (connect(cups_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("cups connect");
-        close(cups_fd);
-        cups_fd = -1;
-        return -1;
-    }
-    fprintf(stderr, "gadget: connected to CUPS\n");
-    return 0;
-}
-
-/* Write all len bytes to fd, retrying on EINTR. */
-static int write_all(int fd, const char *buf, size_t len)
-{
-    size_t off = 0;
-    while (off < len) {
-        ssize_t n = write(fd, buf + off, len - off);
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
-            return -1;
-        }
-        off += (size_t)n;
-    }
-    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -238,10 +246,11 @@ static void handle_setup(int ep0, const struct usb_ctrlrequest *req)
     uint8_t  rq   = req->bRequest;
     uint16_t wlen = (uint16_t)req->wLength; /* LE on LE system */
 
-    if ((type & USB_TYPE_MASK)  == USB_TYPE_CLASS &&
-        (type & USB_RECIP_MASK) == USB_RECIP_INTERFACE) {
+    if ((type & USB_TYPE_MASK)  == USB_TYPE_CLASS && (type & USB_RECIP_MASK) == USB_RECIP_INTERFACE) 
+    {
 
-        if (rq == PRINTER_REQ_GET_DEVICE_ID && (type & USB_DIR_IN)) {
+        if (rq == PRINTER_REQ_GET_DEVICE_ID && (type & USB_DIR_IN))
+        {
             /* IEEE 1284: 2-byte big-endian total length then PnP string. */
             static const char pnp[] = PRINTER_DEV_ID;
             uint16_t total = (uint16_t)(2 + sizeof(pnp) - 1);
@@ -251,8 +260,9 @@ static void handle_setup(int ep0, const struct usb_ctrlrequest *req)
             memcpy(buf + 2, pnp, sizeof(pnp) - 1);
             size_t send = (wlen < total) ? wlen : total;
             write(ep0, buf, send);
-
-        } else if (rq == PRINTER_REQ_GET_PORT_STATUS && (type & USB_DIR_IN)) {
+        }
+        else if (rq == PRINTER_REQ_GET_PORT_STATUS && (type & USB_DIR_IN))
+        {
             /*
              * Port status byte (USB Printer Class 1.1 Table 3):
              *   bit5 = Paper Empty (0 = paper present)
@@ -261,24 +271,36 @@ static void handle_setup(int ep0, const struct usb_ctrlrequest *req)
              */
             uint8_t status = 0x18; /* selected, no error, paper loaded */
             write(ep0, &status, (wlen < 1) ? 0 : 1);
-
-        } else if (rq == PRINTER_REQ_SOFT_RESET && !(type & USB_DIR_IN)) {
-            /* OUT request, no data — ACK and drop the CUPS connection. */
+        }
+        else if (rq == PRINTER_REQ_SOFT_RESET && !(type & USB_DIR_IN))
+        {
+            /* OUT request, no data — ACK and drop both CUPS connections. */
             read(ep0, NULL, 0);
-            cups_close();
 
-        } else {
+        }
+        else
+        {
             /* Unknown class request — send empty response. */
             if (type & USB_DIR_IN)
+            {
                 write(ep0, NULL, 0);
+            }
             else
+            {
                 read(ep0, NULL, 0);
+            }
         }
-    } else {
+    } 
+    else 
+    {
         if (type & USB_DIR_IN)
+        {
             write(ep0, NULL, 0);
+        }
         else
+        {
             read(ep0, NULL, 0);
+        }
     }
 }
 
@@ -307,7 +329,6 @@ static int process_ep0_event(int ep0)
         break;
     case FUNCTIONFS_UNBIND:
         fprintf(stderr, "gadget: UNBIND\n");
-        cups_close();
         running = 0;
         break;
     case FUNCTIONFS_ENABLE:
@@ -315,10 +336,11 @@ static int process_ep0_event(int ep0)
         return 1;
     case FUNCTIONFS_DISABLE:
         fprintf(stderr, "gadget: DISABLE\n");
-        cups_close();
         return -2;
     case FUNCTIONFS_SETUP:
+        fprintf(stderr, "gadget: SETUP\n");
         handle_setup(ep0, &ev.u.setup);
+        fprintf(stderr, "gadget: SETUP done\n");
         break;
     default:
         break;
@@ -338,10 +360,12 @@ int main(int argc, char *argv[])
     signal(SIGTERM, on_signal);
     signal(SIGPIPE, SIG_IGN);
 
-    char ep0_path[256], ep1_path[256], ep2_path[256];
+    char ep0_path[256], ep1_path[256], ep2_path[256], ep3_path[256], ep4_path[256];
     snprintf(ep0_path, sizeof(ep0_path), "%s/ep0", dir);
     snprintf(ep1_path, sizeof(ep1_path), "%s/ep1", dir);
     snprintf(ep2_path, sizeof(ep2_path), "%s/ep2", dir);
+    snprintf(ep3_path, sizeof(ep3_path), "%s/ep3", dir);
+    snprintf(ep4_path, sizeof(ep4_path), "%s/ep4", dir);
 
     int ep0 = open(ep0_path, O_RDWR);
     if (ep0 < 0) {
@@ -362,21 +386,23 @@ int main(int argc, char *argv[])
 
     fprintf(stderr, "gadget: descriptors written, waiting for host...\n");
 
-    int ep_in = -1, ep_out = -1;
-    static char buf[BULK_BUF_SIZE];
+    int ep_in = -1, ep_out = -1, ep_in2 = -1, ep_out2 = -1;
 
-    while (running) {
+    while (running)
+    {
         /*
          * poll() ignores entries where fd < 0 (sets revents = 0).
-         * cups_fd and ep_out are -1 until ENABLE; no special casing needed.
+         * All data fds are -1 until ENABLE; no special casing needed.
+         * CUPS responses are handled inline after each write.
          */
         struct pollfd fds[3] = {
             { .fd = ep0,     .events = POLLIN },
             { .fd = ep_out,  .events = POLLIN },
-            { .fd = cups_fd, .events = POLLIN },
+            { .fd = ep_out2, .events = POLLIN },
         };
 
-        if (poll(fds, 3, -1) < 0) {
+        if (poll(fds, 3, -1) < 0)
+        {
             if (errno == EINTR)
                 continue;
             perror("poll");
@@ -384,65 +410,58 @@ int main(int argc, char *argv[])
         }
 
         /* ep0 control events */
-        if (fds[0].revents & POLLIN) {
+        if (fds[0].revents & POLLIN)
+        {
             int rc = process_ep0_event(ep0);
-            if (rc == 1) {
-                ep_in  = open(ep1_path, O_RDWR);
-                ep_out = open(ep2_path, O_RDWR);
-                if (ep_in < 0 || ep_out < 0) {
-                    perror("open data endpoints");
-                    break;
-                }
-                /* Eagerly connect to CUPS; retry lazily on first write if not ready. */
-                if (cups_connect() < 0)
-                    fprintf(stderr, "gadget: CUPS not ready, will retry\n");
-                fprintf(stderr, "gadget: IPP bridge active\n");
-            } else if (rc == -2) {
-                if (ep_in  >= 0) { close(ep_in);  ep_in  = -1; }
-                if (ep_out >= 0) { close(ep_out); ep_out = -1; }
+            if (rc == 1)
+            {
+                    /* Close any endpoints leftover from a previous ENABLE. */
+                    if (ep_in   >= 0) { close(ep_in);   ep_in   = -1; }
+                    if (ep_out  >= 0) { close(ep_out);  ep_out  = -1; }
+                    if (ep_in2  >= 0) { close(ep_in2);  ep_in2  = -1; }
+                    if (ep_out2 >= 0) { close(ep_out2); ep_out2 = -1; }
+                    ep_in   = open(ep1_path, O_RDWR);
+                    ep_out  = open(ep2_path, O_RDWR);
+                    ep_in2  = open(ep3_path, O_RDWR);
+                    ep_out2 = open(ep4_path, O_RDWR);
+                    if (ep_in < 0 || ep_out < 0 || ep_in2 < 0 || ep_out2 < 0) {
+                        perror("open data endpoints");
+                        break;
+                    }
+                    /* Connect lazily on first write so we never hold a stale connection. */
+                    fprintf(stderr, "gadget: IPP bridge active\n");
+            }
+            else if (rc == -2)
+            {
+                if (ep_in   >= 0) { close(ep_in);   ep_in   = -1; }
+                if (ep_out  >= 0) { close(ep_out);  ep_out  = -1; }
+                if (ep_in2  >= 0) { close(ep_in2);  ep_in2  = -1; }
+                if (ep_out2 >= 0) { close(ep_out2); ep_out2 = -1; }
                 fprintf(stderr, "gadget: IPP bridge suspended\n");
-            } else if (rc < 0) {
+            }
+            else if (rc < 0)
+            {
                 break;
             }
         }
 
-        /* USB OUT → CUPS */
-        if (ep_out >= 0 && (fds[1].revents & POLLIN)) {
-            ssize_t n = read(ep_out, buf, sizeof(buf));
-            if (n < 0) {
-                if (errno == EINTR || errno == ESHUTDOWN)
-                    continue;
-                perror("ep_out read");
-                break;
-            }
-            if (n > 0) {
-                if (cups_connect() < 0) {
-                    fprintf(stderr, "gadget: CUPS unavailable, dropping %zd bytes\n", n);
-                } else if (write_all(cups_fd, buf, (size_t)n) < 0) {
-                    fprintf(stderr, "gadget: CUPS write error, reconnecting\n");
-                    cups_close();
-                }
-            }
+        /* USB OUT → log (interface 0) */
+        if (ep_out >= 0 && (fds[1].revents & POLLIN))
+        {
+            read_ep(ep_out, 0);
         }
 
-        /* CUPS → USB IN */
-        if (cups_fd >= 0 && (fds[2].revents & (POLLIN | POLLHUP | POLLERR))) {
-            ssize_t n = read(cups_fd, buf, sizeof(buf));
-            if (n <= 0) {
-                fprintf(stderr, "gadget: CUPS closed connection\n");
-                cups_close();
-            } else if (ep_in >= 0) {
-                if (write_all(ep_in, buf, (size_t)n) < 0) {
-                    if (errno != ESHUTDOWN)
-                        perror("ep_in write");
-                }
-            }
+        /* USB OUT → log (interface 1) */
+        if (ep_out2 >= 0 && (fds[2].revents & POLLIN))
+        {
+            read_ep(ep_out2, 1);
         }
     }
 
-    if (ep_in  >= 0) close(ep_in);
-    if (ep_out >= 0) close(ep_out);
-    cups_close();
+    if (ep_in   >= 0) close(ep_in);
+    if (ep_out  >= 0) close(ep_out);
+    if (ep_in2  >= 0) close(ep_in2);
+    if (ep_out2 >= 0) close(ep_out2);
     close(ep0);
 
     fprintf(stderr, "gadget: stopped\n");

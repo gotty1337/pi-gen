@@ -1,7 +1,7 @@
 [Unit]
 Description=USB IPP Printer Gadget
-After=local-fs.target cups.service
-Wants=cups.service
+After=local-fs.target cups.service cups-printer-setup.service
+Wants=cups.service cups-printer-setup.service
 
 [Service]
 Type=simple
