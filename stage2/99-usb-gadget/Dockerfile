@@ -18,7 +18,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Kernel headers in the cross-compiler sysroots (needed by aarch64/armhf gcc)
     linux-libc-dev-arm64-cross \
     linux-libc-dev-armhf-cross \
-    libcups2-dev \
     # Handy dev tools
     gdb-multiarch \
     file \

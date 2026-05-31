@@ -16,6 +16,14 @@ if [ -f /etc/cups/cups-pdf.conf ]; then
         /etc/cups/cups-pdf.conf
 fi
 
+# Allow CUPS to accept IPP requests addressed to any hostname/port.
+# ipp-usb probes via its own proxy (e.g. http://localhost:60000/ipp/print);
+# without ServerAlias * CUPS rejects the printer-uri as "not my server"
+# and returns client-error-not-found, causing ipp-usb to reset the device.
+if ! grep -q "^ServerAlias \*" /etc/cups/cupsd.conf; then
+    echo "ServerAlias *" >> /etc/cups/cupsd.conf
+fi
+
 # Enable CUPS access log and global printer sharing.
 # --share-printers activates the /ipp/print endpoint that ipp-usb probes.
 cupsctl LogLevel=info --share-printers

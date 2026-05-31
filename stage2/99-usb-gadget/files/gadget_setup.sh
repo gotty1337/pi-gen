@@ -25,6 +25,7 @@ mkdir -p "${GADGET}"
 echo 0x1d6b > "${GADGET}/idVendor"   # Linux Foundation
 echo 0x0104 > "${GADGET}/idProduct"  # Multifunction Composite Gadget
 echo 0x0200 > "${GADGET}/bcdUSB"     # USB 2.0
+echo "full-speed" > "${GADGET}/max_speed"   # FS only – no HS descriptors needed
 echo 0x00   > "${GADGET}/bDeviceClass"    # Class defined at interface level
 echo 0x00   > "${GADGET}/bDeviceSubClass"
 echo 0x00   > "${GADGET}/bDeviceProtocol"
