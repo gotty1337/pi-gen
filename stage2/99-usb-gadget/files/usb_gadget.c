@@ -228,11 +228,6 @@ static int process_ep0_event(int ep0)
 
     ssize_t n = read(ep0, &ev, sizeof(ev));
     if (n < 0) {
-        if (errno == EINTR)
-        {
-            LogPrintf("%s: ep0 read interrupted by signal, continuing\n", __FUNCTION__);
-            return 0;
-        }
         LogPrintf("%s: error reading ep0 event: %s\n", __FUNCTION__, strerror(errno));
         return -1;
     }
@@ -244,28 +239,25 @@ static int process_ep0_event(int ep0)
     }
 
     switch (ev.type) {
+        case FUNCTIONFS_SETUP:
+            LogPrintf("%s: SETUP\n", __FUNCTION__);
+            return 0;
         case FUNCTIONFS_BIND:
             LogPrintf("%s: BIND\n", __FUNCTION__);
-            break;
-        case FUNCTIONFS_UNBIND:
-            LogPrintf("%s: UNBIND\n", __FUNCTION__);
-            g_ctx.running = 0;
-            break;
+            return 0;
         case FUNCTIONFS_ENABLE:
             LogPrintf("%s: ENABLE\n", __FUNCTION__);
             return 1;
         case FUNCTIONFS_DISABLE:
             LogPrintf("%s: DISABLE\n", __FUNCTION__);
             return -2;
-        case FUNCTIONFS_SETUP:
-            LogPrintf("%s: SETUP\n", __FUNCTION__);
-            break;
+        case FUNCTIONFS_UNBIND:
+            LogPrintf("%s: UNBIND\n", __FUNCTION__);
+            return -3;
         default:
             LogPrintf("%s: unknown event type %d\n", __FUNCTION__, ev.type);
-            break;
+            return -3;
     }
-
-    return 0;
 }
 
 /* 
@@ -425,26 +417,17 @@ void *ep_worker_thread(void *ptr) {
             continue;
         }
 
-        if (iRv == 0 || !g_ctx.running || !g_ctx.fds_ready) {
-            LogPrintf("%s: IF%d poll timeout or not ready, continuing\n", __FUNCTION__, ptCtx->iIfaceNum);
-            continue;
-        }
-
         /* ep_out → CUPS → ep_in: full request/response cycle */
         if (sFd.revents & POLLIN) {
             ssize_t nRead = read(iEpOut, pcBuf, CUPS_BUF_SIZE);
-            if (nRead < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (nRead < 0 && (errno == EAGAIN)) {
                 /* Spurious POLLIN from FunctionFS — no real data yet, skip. */
                 continue;
-            } else if (nRead < 0 && errno != EINTR) {
+            } else if (nRead < 0) {
                 LogPrintf("%s: IF%d read ep_out: %s\n", __FUNCTION__, ptCtx->iIfaceNum, strerror(errno));
                 if (iEpIn   >= 0) { close(iEpIn);   iEpIn   = -1; }
                 if (iEpOut  >= 0) { close(iEpOut);  iEpOut  = -1; }
                 if (iCupsFd >= 0) { close(iCupsFd); iCupsFd = -1; }
-                continue;
-            }
-
-            if (nRead <= 0 || g_ctx.running == 0 || g_ctx.fds_ready == 0) {
                 continue;
             }
 
@@ -520,21 +503,16 @@ void *ep0_worker_thread(void *ptr)
     int iEp0 = open(ptCtx->acEp0Path, O_RDWR);
     if (iEp0 < 0) {
         LogPrintf("%s: failed to open ep0: %s\n", __FUNCTION__, strerror(errno));
-        g_ctx.running = 0;
-        return ptr;
+        goto exit;
     }
 
     if (write(iEp0, &descriptors, sizeof(descriptors)) != sizeof(descriptors)) {
         LogPrintf("%s: failed to write descriptors: %s\n", __FUNCTION__, strerror(errno));
-        close(iEp0);
-        g_ctx.running = 0;
-        return ptr;
+        goto exit;
     }
     if (write(iEp0, &strings, sizeof(strings)) != sizeof(strings)) {
         LogPrintf("%s: failed to write strings: %s\n", __FUNCTION__, strerror(errno));
-        close(iEp0);
-        g_ctx.running = 0;
-        return ptr;
+        goto exit;
     }
 
     LogPrintf("%s: descriptors written, waiting for host...\n", __FUNCTION__);
@@ -553,36 +531,32 @@ void *ep0_worker_thread(void *ptr)
                 continue;
             }
             LogPrintf("%s: poll error: %s\n", __FUNCTION__, strerror(errno));
-            g_ctx.running = 0;
             break;
         }
 
-        if (iRv == 0 || g_ctx.running == 0)
-        {
-            continue;
-        }
-
-        iRv = process_ep0_event(iEp0);
-        if (iRv == 1)
-        {
-            g_ctx.fds_ready = 1;
-        } 
-        else if (iRv == -2)
-        {
-            g_ctx.fds_ready = 0;
-        }
-        else if (iRv < 0)
-        {
-            g_ctx.running = 0;
-            break;
-        }
+        if (sFds[0].revents & POLL_IN) {
+            iRv = process_ep0_event(iEp0);
+            if (iRv == 1)
+            {
+                g_ctx.fds_ready = 1;
+            } 
+            else if (iRv == -2)
+            {
+                g_ctx.fds_ready = 0;
+            }
+            else if (iRv < 0)
+            {
+                break;
+            }
+        }    
     }
 
-    close(iEp0);
-
-    LogPrintf("%s: exit ep0 worker thread\n", __FUNCTION__);
-    
-    return ptr;
+    exit:
+        close(iEp0);
+        g_ctx.running = 0;
+        g_ctx.fds_ready = 0;
+        LogPrintf("%s: exit ep0 worker thread\n", __FUNCTION__);
+        return ptr;
 }
 
 /* ------------------------------------------------------------------ */
