@@ -14,12 +14,10 @@ install -m 755 "${FILES}/gadget_build.sh"       "${DEST}/gadget_build.sh"
 install -m 755 "${FILES}/gadget_setup.sh"       "${DEST}/gadget_setup.sh"
 install -m 755 "${FILES}/gadget_enable.sh"      "${DEST}/gadget_enable.sh"
 install -m 755 "${FILES}/gadget_teardown.sh"    "${DEST}/gadget_teardown.sh"
-install -m 755 "${FILES}/cups_printer_setup.sh" "${DEST}/cups_printer_setup.sh"
-
 install -m 644 "${FILES}/usb-gadget.service" \
     "${ROOTFS_DIR}/etc/systemd/system/usb-gadget.service"
-install -m 644 "${FILES}/cups-printer-setup.service" \
-    "${ROOTFS_DIR}/etc/systemd/system/cups-printer-setup.service"
+install -m 644 "${FILES}/ipp-printer.service" \
+    "${ROOTFS_DIR}/etc/systemd/system/ipp-printer.service"
 
 # Configure the dwc2 USB controller for peripheral (device) mode.
 # Remove any conflicting host or OTG-mode entries first, then append the
@@ -37,15 +35,9 @@ fi
 on_chroot << 'EOF'
 chown -R pi:pi /home/pi/usb-gadget
 
-# Install CUPS packages with a policy-rc.d that blocks service operations
-# in the chroot, preventing the postinst scripts from trying (and failing)
-# to start/reload cupsd.
-printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
-chmod +x /usr/sbin/policy-rc.d
-apt-get install -y cups printer-driver-cups-pdf
-rm -f /usr/sbin/policy-rc.d
+# Create output directory for ippeveprinter print jobs
+install -d -m 755 -o pi -g pi /home/pi/PDF
 
 systemctl enable usb-gadget.service
-systemctl enable cups.service
-systemctl enable cups-printer-setup.service
+systemctl enable ipp-printer.service
 EOF

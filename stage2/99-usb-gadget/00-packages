@@ -1,5 +1,3 @@
 gcc
 make
-libcups2-dev
-libcurl-dev
-cups-pdf
+cups-ipp-utils

@@ -12,7 +12,7 @@ BIN="${GADGET_DIR}/usb_gadget"
 
 if [ ! -f "${BIN}" ] || [ "${SRC}" -nt "${BIN}" ]; then
     echo "gadget_build: compiling ${SRC}"
-    gcc -O2 -Wall -Wextra -o "${BIN}" "${SRC}" -lcups
+    gcc -O2 -Wall -Wextra -o "${BIN}" "${SRC}"
     chmod 755 "${BIN}"
     echo "gadget_build: done"
 else
