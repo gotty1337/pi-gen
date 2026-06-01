@@ -39,8 +39,23 @@
 /* Globals                                                            */
 /* ------------------------------------------------------------------ */
 
-#define FFS_DEFAULT     "/dev/ffs-loopback"
-#define IFACE_STR       "IPP Printer"
+#define FFS_DEFAULT         "/dev/ffs-loopback"
+#define IFACE_STR           "IPP Printer"
+#define CUPS_SOCKET_PATH    "/run/cups/cups.sock"
+#define CUPS_BUF_SIZE       (64 * 1024)  /* 64 KiB I/O chunks */
+
+/*
+ * IEEE 1284 Device ID string.  CMD:IPP is what triggers Windows' built-in
+ * driverless IPP-over-USB driver; the rest is informational.
+ */
+#define PRINTER_DEV_ID \
+    "MFG:Raspberry Pi;MDL:USB Printer;CMD:IPP,PDF,PWGRaster;" \
+    "CLS:PRINTER;DRV:DRVLESS;"
+
+#define PRINTER_REQ_GET_DEVICE_ID   0x00
+#define PRINTER_REQ_GET_PORT_STATUS 0x01
+#define PRINTER_REQ_SOFT_RESET      0x02
+
 
 /*
  * htole16/32 from <endian.h> are glibc inline functions and are not
@@ -195,70 +210,16 @@ static struct usb_gadget {
     .fds_ready = 0,
 };
 
-/*
- * Simple logging helper.
- */
-static void LogPrintf(const char *fmt, ...)
-{
-    va_list ap = {};
-    va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
-    va_end(ap);
-    fflush(stderr);
-}
-
-/*
- * Signal handler for clean shutdown on SIGINT/SIGTERM.
- */
-static void on_signal(int sig)
-{
-    (void)sig;
-    LogPrintf("gadget: signal received, stopping...\n");
-    g_ctx.running = 0;
-} 
-
 /* ------------------------------------------------------------------ */
-/* ep0 event processing                                               */
-/* Returns:  1 = ENABLE,  -2 = DISABLE,  -1 = fatal,  0 = other      */
+/* EP0 event types                                                     */
 /* ------------------------------------------------------------------ */
-
-static int process_ep0_event(int ep0)
-{
-    struct usb_functionfs_event ev = {};
-
-    ssize_t n = read(ep0, &ev, sizeof(ev));
-    if (n < 0) {
-        LogPrintf("%s: error reading ep0 event: %s\n", __FUNCTION__, strerror(errno));
-        return -1;
-    }
-
-    if ((size_t)n < sizeof(ev))
-    {
-        LogPrintf("%s: incomplete ep0 event read: %zd bytes\n", __FUNCTION__, n);
-        return 0;
-    }
-
-    switch (ev.type) {
-        case FUNCTIONFS_SETUP:
-            LogPrintf("%s: SETUP\n", __FUNCTION__);
-            return 0;
-        case FUNCTIONFS_BIND:
-            LogPrintf("%s: BIND\n", __FUNCTION__);
-            return 0;
-        case FUNCTIONFS_ENABLE:
-            LogPrintf("%s: ENABLE\n", __FUNCTION__);
-            return 1;
-        case FUNCTIONFS_DISABLE:
-            LogPrintf("%s: DISABLE\n", __FUNCTION__);
-            return -2;
-        case FUNCTIONFS_UNBIND:
-            LogPrintf("%s: UNBIND\n", __FUNCTION__);
-            return -3;
-        default:
-            LogPrintf("%s: unknown event type %d\n", __FUNCTION__, ev.type);
-            return -3;
-    }
-}
+typedef enum {
+    EP0_EVENT_OK,
+    EP0_EVENT_SETUP,
+    EP0_EVENT_FDS_READY,
+    EP0_EVENT_FDS_NOT_READY,
+    EP0_EVENT_ERROR,
+} ep0_event_type_t;
 
 /* 
  * EP0 worker thread context
@@ -281,40 +242,168 @@ typedef struct {
 } ep_worker_ctx_t;
 
 /*
- * Context shared between ep_read_sub_thread and ep_write_sub_thread.
+ * Worker thread to handle writes from ep_out to CUPS and responses back to ep_in.
+ * This allows us to keep the CUPS connection open across multiple requests and
+ * avoid the overhead of reconnecting for each request.
  */
 typedef struct {
-    int              iIfaceNum;
-    int              iEpIn;
-    int              iEpOut;
-    /* Fresh CUPS fd produced by reader, consumed by writer (-1 = none pending) */
-    int              iCupsFd;
-    pthread_mutex_t  tMutex;
-    pthread_cond_t   tCondReady; /* reader → writer: new CUPS fd available */
-    pthread_cond_t   tCondFree;  /* writer → reader: CUPS fd consumed      */
-} ep_io_ctx_t;
-
-/* ------------------------------------------------------------------ */
-/* CUPS forwarding                                                    */
-/* ------------------------------------------------------------------ */
-
-#define CUPS_SOCKET_PATH  "/run/cups/cups.sock"
-#define CUPS_BUF_SIZE     (64 * 1024)  /* 64 KiB I/O chunks */
+    /* Interface number for logging purposes */
+    int iIfaceNum;
+    /* Paths for the IN and OUT endpoints of this interface */
+    const char *acEpInPath;
+    /* Read buffer */
+    char *pacRead;
+    /* Number of bytes read into pacRead */
+    ssize_t nRead;
+} ep_cups_worker_ctx_t;
 
 /*
- * write_all - Write exactly nLen bytes from pBuf to fd, retrying on EINTR.
- * Returns 0 on success, -1 on error.
+ * Simple logging helper.
  */
-static int write_all(int fd, const uint8_t *pBuf, size_t nLen)
+static void LogPrintf(const char *fmt, ...)
+{
+    va_list ap = {};
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fflush(stderr);
+}
+
+/*
+ * Signal handler for clean shutdown on SIGINT/SIGTERM.
+ */
+static void on_signal(int sig)
+{
+    (void)sig;
+    g_ctx.running = 0;
+    /* LogPrintf is not async-signal-safe; log is emitted by ep0 thread. */
+} 
+
+/* 
+ * handle_setup - Process a control request received on ep0. This is called
+ * from the ep0 worker thread when a SETUP event is received. It handles
+ * class-specific requests for the Printer interface and sends appropriate
+ * responses back to the host.
+ */
+static void handle_setup(int ep0, const struct usb_ctrlrequest *req)
+{
+    uint8_t  type = req->bRequestType;
+    uint8_t  rq   = req->bRequest;
+    uint16_t wlen = (uint16_t)req->wLength; /* LE on LE system */
+
+    if ((type & USB_TYPE_MASK)  == USB_TYPE_CLASS && (type & USB_RECIP_MASK) == USB_RECIP_INTERFACE) 
+    {
+
+        if (rq == PRINTER_REQ_GET_DEVICE_ID && (type & USB_DIR_IN))
+        {
+            /* IEEE 1284: 2-byte big-endian total length then PnP string. */
+            static const char pnp[] = PRINTER_DEV_ID;
+            uint16_t total = (uint16_t)(2 + sizeof(pnp) - 1);
+            uint8_t  buf[2 + sizeof(pnp) - 1];
+            buf[0] = (uint8_t)(total >> 8);
+            buf[1] = (uint8_t)(total & 0xff);
+            memcpy(buf + 2, pnp, sizeof(pnp) - 1);
+            size_t send = (wlen < total) ? wlen : total;
+            write(ep0, buf, send);
+        }
+        else if (rq == PRINTER_REQ_GET_PORT_STATUS && (type & USB_DIR_IN))
+        {
+            /*
+             * Port status byte (USB Printer Class 1.1 Table 3):
+             *   bit5 = Paper Empty (0 = paper present)
+             *   bit4 = Select      (1 = selected/online)
+             *   bit3 = Not Error   (1 = no error condition)
+             */
+            uint8_t status = 0x18; /* selected, no error, paper loaded */
+            write(ep0, &status, (wlen < 1) ? 0 : 1);
+        }
+        else if (rq == PRINTER_REQ_SOFT_RESET && !(type & USB_DIR_IN))
+        {
+            /* OUT request, no data — ACK and drop both CUPS connections. */
+            read(ep0, NULL, 0);
+
+        }
+        else
+        {
+            /* Unknown class request — send empty response. */
+            if (type & USB_DIR_IN)
+            {
+                write(ep0, NULL, 0);
+            }
+            else
+            {
+                read(ep0, NULL, 0);
+            }
+        }
+    } 
+    else 
+    {
+        if (type & USB_DIR_IN)
+        {
+            write(ep0, NULL, 0);
+        }
+        else
+        {
+            read(ep0, NULL, 0);
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* ep0 event processing                                               */
+/* ------------------------------------------------------------------ */
+    static ep0_event_type_t process_ep0_event(int ep0)
+{
+    struct usb_functionfs_event ev = {};
+
+    ssize_t n = read(ep0, &ev, sizeof(ev));
+    if (n < 0) {
+        LogPrintf("%s: error reading ep0 event: %s\n", __FUNCTION__, strerror(errno));
+        return EP0_EVENT_OK;
+    }
+
+    if ((size_t)n < sizeof(ev))
+    {
+        LogPrintf("%s: incomplete ep0 event read: %zd bytes\n", __FUNCTION__, n);
+        return EP0_EVENT_OK;
+    }
+
+    switch (ev.type) {
+        case FUNCTIONFS_SETUP:
+            LogPrintf("%s: SETUP\n", __FUNCTION__);
+            handle_setup(ep0, &ev.u.setup);
+            return EP0_EVENT_OK;
+        case FUNCTIONFS_BIND:
+            LogPrintf("%s: BIND\n", __FUNCTION__);
+            return EP0_EVENT_OK;
+        case FUNCTIONFS_ENABLE:
+            LogPrintf("%s: ENABLE\n", __FUNCTION__);
+            return EP0_EVENT_FDS_READY;
+        case FUNCTIONFS_DISABLE:
+            LogPrintf("%s: DISABLE\n", __FUNCTION__);
+            return EP0_EVENT_FDS_NOT_READY;
+        case FUNCTIONFS_UNBIND:
+            LogPrintf("%s: UNBIND\n", __FUNCTION__);
+            return EP0_EVENT_ERROR;
+        default:
+            LogPrintf("%s: unknown event type %d\n", __FUNCTION__, ev.type);
+            return EP0_EVENT_ERROR;
+    }
+}
+
+/*
+ * write_all - Write exactly nLen bytes from pBuf to fd.
+ * Aborts early if g_ctx.running == 0 (shutdown in progress).
+ * Returns 0 on success, -1 on error or shutdown.
+ */
+static int write_all(int fd, const char *pacBuf, size_t nLen)
 {
     size_t nSent = 0;
     while (nSent < nLen) {
-        ssize_t n = write(fd, pBuf + nSent, nLen - nSent);
+        if (!g_ctx.running) { errno = ECANCELED; return -1; } /* shutdown: abort */
+        ssize_t n = write(fd, pacBuf + nSent, nLen - nSent);
         if (n < 0) {
-            if (errno == EINTR) {
-                LogPrintf("%s: write interrupted by signal, retrying\n", __FUNCTION__);
-                continue;
-            }
+            if (errno == EINTR) continue; /* signal: recheck running above */
             LogPrintf("%s: write error: %s\n", __FUNCTION__, strerror(errno));
             return -1;
         }
@@ -349,6 +438,71 @@ static int connect_to_cups(int iIfaceNum)
     return iFd;
 }
 
+void *ep_cups_worker_thread(void *ptr) {
+    if (ptr == NULL) {
+        LogPrintf("%s: invalid context\n", __FUNCTION__);
+        return ptr;
+    }
+
+    ep_cups_worker_ctx_t *ptCtx = (ep_cups_worker_ctx_t *)ptr;
+
+    LogPrintf("%s: IF%d write worker thread started\n", __FUNCTION__, ptCtx->iIfaceNum);
+
+    int iCupsFd = connect_to_cups(ptCtx->iIfaceNum);
+    if (iCupsFd < 0) {
+        LogPrintf("%s: IF%d could not connect to CUPS, dropping %zd bytes\n", __FUNCTION__, ptCtx->iIfaceNum, ptCtx->nRead);
+        goto exit;
+    }
+    
+    LogPrintf("%s: IF%d connected to CUPS successfully\n", __FUNCTION__, ptCtx->iIfaceNum);
+
+    if (write_all(iCupsFd, ptCtx->pacRead, (size_t)ptCtx->nRead) < 0) {
+        LogPrintf("%s: IF%d write to CUPS failed: %s\n", __FUNCTION__, ptCtx->iIfaceNum, strerror(errno));
+        close(iCupsFd); iCupsFd = -1;
+        goto exit;
+    }
+    
+    LogPrintf("%s: IF%d forwarded %zd bytes to CUPS\n", __FUNCTION__, ptCtx->iIfaceNum, ptCtx->nRead);
+
+    struct pollfd sCupsPfd = { .fd = iCupsFd, .events = POLLIN | POLLERR | POLLHUP | POLLNVAL };
+    int iRv = poll(&sCupsPfd, 1, 500);
+    if (iRv > 0 && (sCupsPfd.revents & POLLIN)) {
+        char acBuf[CUPS_BUF_SIZE] = {};
+        ssize_t nResp = read(iCupsFd, acBuf, CUPS_BUF_SIZE);
+        
+        LogPrintf("%s: IF%d read %zd bytes from CUPS\n", __FUNCTION__, ptCtx->iIfaceNum, nResp);
+        
+        if (nResp > 0) {
+            const int iEpIn = open(ptCtx->acEpInPath, O_RDWR | O_NONBLOCK);
+            if (iEpIn > 0) {
+                LogPrintf("%s: IF%d ep in opened successfully\n", __FUNCTION__, ptCtx->iIfaceNum);
+                if (write_all(iEpIn, acBuf, (size_t)nResp) < 0) {
+                    LogPrintf("%s: IF%d write ep_in: %s\n", __FUNCTION__, ptCtx->iIfaceNum, strerror(errno));
+                } else {
+                    LogPrintf("%s: IF%d wrote %zd bytes to ep_in\n", __FUNCTION__, ptCtx->iIfaceNum, nResp);                        
+                }
+                close(iEpIn);
+            } else {
+                LogPrintf("%s: IF%d failed to open ep_in for writing response: %s\n", __FUNCTION__, ptCtx->iIfaceNum, strerror(errno));
+            }
+        }
+    } else {
+        LogPrintf("%s: IF%d poll CUPS response: %s\n", __FUNCTION__, ptCtx->iIfaceNum, (iRv < 0) ? strerror(errno) : "timeout");
+    }
+
+    LogPrintf("%s: IF%d close CUPS connection\n", __FUNCTION__, ptCtx->iIfaceNum);
+    if (iCupsFd >= 0) { close(iCupsFd); iCupsFd = -1; }
+    goto exit;
+
+    exit:
+        LogPrintf("%s: IF%d write worker thread exiting\n", __FUNCTION__, ptCtx->iIfaceNum);
+        free(ptCtx->pacRead);
+        ptCtx->pacRead = NULL;
+        ptCtx->nRead = 0;
+        free(ptCtx);
+        return ptr;
+}
+
 void *ep_worker_thread(void *ptr) {
     if (ptr == NULL) {
         LogPrintf("%s: invalid context\n", __FUNCTION__);
@@ -364,118 +518,86 @@ void *ep_worker_thread(void *ptr) {
         return ptr;
     }
 
-    int iEpIn = -1, iEpOut = -1, iCupsFd = -1;
-
-    uint8_t *pcBuf = malloc(CUPS_BUF_SIZE);
-    if (!pcBuf) {
-        LogPrintf("%s: IF%d OOM\n", __FUNCTION__, ptCtx->iIfaceNum);
-        return ptr;
-    }
+    int iEpOut = -1;
 
     while (g_ctx.running) {
-
-        memset(pcBuf, 0, CUPS_BUF_SIZE);
-
-        if (!g_ctx.fds_ready)
-        {
-            if (iEpIn    >= 0) { close(iEpIn);    iEpIn    = -1; }
-            if (iEpOut   >= 0) { close(iEpOut);   iEpOut   = -1; }
-            if (iCupsFd  >= 0) { close(iCupsFd);  iCupsFd  = -1; }
-            usleep(100000);
+        if (!g_ctx.fds_ready) {
+            if (iEpOut >= 0) { close(iEpOut); iEpOut = -1; }
+            usleep(100000); /* 100ms */
             continue;
-        }
-
-        if (iEpIn < 0) {
-            iEpIn = open(ptCtx->acEpInPath, O_RDWR | O_NONBLOCK);
-            if (iEpIn < 0) {
-                LogPrintf("%s: IF%d failed to open IN endpoint: %s\n", __FUNCTION__, ptCtx->iIfaceNum, strerror(errno));
-                continue;
-            }
-            LogPrintf("%s: IF%d ep in opened successfully\n", __FUNCTION__, ptCtx->iIfaceNum);
         }
 
         if (iEpOut < 0) {
             iEpOut = open(ptCtx->acEpOutPath, O_RDWR | O_NONBLOCK);
             if (iEpOut < 0) {
                 LogPrintf("%s: IF%d failed to open OUT endpoint: %s\n", __FUNCTION__, ptCtx->iIfaceNum, strerror(errno));
-                if (iEpIn >= 0) { close(iEpIn); iEpIn = -1; }
+                usleep(10000); /* 10ms before retry to avoid tight spin */
                 continue;
             }
             LogPrintf("%s: IF%d ep out opened successfully\n", __FUNCTION__, ptCtx->iIfaceNum);
         }
 
-        /* Poll only ep_out. CUPS response is read synchronously right after
-         * each write, so no need to poll the CUPS fd. */
         struct pollfd sFd = { .fd = iEpOut, .events = POLLIN | POLLERR | POLLHUP | POLLNVAL };
-
-        int iRv = poll(&sFd, 1, 200);
+        int iRv = poll(&sFd, 1, 100);
         if (iRv < 0) {
-            if (iEpIn   >= 0) { close(iEpIn);   iEpIn   = -1; }
-            if (iEpOut  >= 0) { close(iEpOut);  iEpOut  = -1; }
-            if (iCupsFd >= 0) { close(iCupsFd); iCupsFd = -1; }
+            if (errno == EINTR) {
+                continue;
+            }
             LogPrintf("%s: IF%d poll error: %s\n", __FUNCTION__, ptCtx->iIfaceNum, strerror(errno));
+            close(iEpOut); iEpOut = -1;
+            continue;
+        }
+
+        if (iRv == 0) {
+            LogPrintf("%s: IF%d poll timeout, no data on ep_out\n", __FUNCTION__, ptCtx->iIfaceNum);
+            continue;
+        }
+
+        if (sFd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            LogPrintf("%s: IF%d ep_out error/hangup (revents=0x%x), closing\n",
+                      __FUNCTION__, ptCtx->iIfaceNum, sFd.revents);
+            close(iEpOut); iEpOut = -1;
             continue;
         }
 
         /* ep_out → CUPS → ep_in: full request/response cycle */
         if (sFd.revents & POLLIN) {
-            ssize_t nRead = read(iEpOut, pcBuf, CUPS_BUF_SIZE);
-            if (nRead < 0 && (errno == EAGAIN)) {
-                /* Spurious POLLIN from FunctionFS — no real data yet, skip. */
-                continue;
-            } else if (nRead < 0) {
-                LogPrintf("%s: IF%d read ep_out: %s\n", __FUNCTION__, ptCtx->iIfaceNum, strerror(errno));
-                if (iEpIn   >= 0) { close(iEpIn);   iEpIn   = -1; }
-                if (iEpOut  >= 0) { close(iEpOut);  iEpOut  = -1; }
-                if (iCupsFd >= 0) { close(iCupsFd); iCupsFd = -1; }
+            char acBuf[CUPS_BUF_SIZE] = {};
+            ssize_t nRead = read(iEpOut, acBuf, CUPS_BUF_SIZE);
+            if (nRead <= 0) {
+                if (nRead < 0 && errno != EAGAIN && errno != EINTR) {
+                    LogPrintf("%s: IF%d read ep_out: %s\n", __FUNCTION__, ptCtx->iIfaceNum, strerror(errno));
+                    close(iEpOut); iEpOut = -1;
+                }
                 continue;
             }
 
             LogPrintf("%s: IF%d read %zd bytes from ep_out\n", __FUNCTION__, ptCtx->iIfaceNum, nRead);
 
-            if (iCupsFd < 0) {
-                iCupsFd = connect_to_cups(ptCtx->iIfaceNum);
-                if (iCupsFd < 0) {
-                    LogPrintf("%s: IF%d could not connect to CUPS, dropping %zd bytes\n", __FUNCTION__, ptCtx->iIfaceNum, nRead);
-                    continue;
-                }
-                LogPrintf("%s: IF%d connected to CUPS successfully\n", __FUNCTION__, ptCtx->iIfaceNum);
-            }
-
-            if (write_all(iCupsFd, pcBuf, (size_t)nRead) < 0) {
-                LogPrintf("%s: IF%d write to CUPS failed: %s\n", __FUNCTION__, ptCtx->iIfaceNum, strerror(errno));
-                close(iCupsFd); iCupsFd = -1;
+            ep_cups_worker_ctx_t *cups_ctx = malloc(sizeof(ep_cups_worker_ctx_t));
+            if (!cups_ctx) {
+                LogPrintf("%s: IF%d malloc cups_ctx failed\n", __FUNCTION__, ptCtx->iIfaceNum);
                 continue;
             }
-            LogPrintf("%s: IF%d forwarded %zd bytes from ep_out to CUPS\n", __FUNCTION__, ptCtx->iIfaceNum, nRead);
+            cups_ctx->iIfaceNum = ptCtx->iIfaceNum;
+            cups_ctx->acEpInPath = ptCtx->acEpInPath;
+            cups_ctx->pacRead = malloc((size_t)nRead);
+            memcpy(cups_ctx->pacRead, acBuf, (size_t)nRead);
+            cups_ctx->nRead = nRead;
 
-            struct pollfd sCupsPfd = { .fd = iCupsFd, .events = POLLIN | POLLERR | POLLHUP | POLLNVAL };
-            int iRv = poll(&sCupsPfd, 1, 500);
-
-            if (iRv > 0 && (sCupsPfd.revents & POLLIN)) {
-                ssize_t nResp = read(iCupsFd, pcBuf, CUPS_BUF_SIZE);
-                
-                LogPrintf("%s: IF%d read %zd bytes from CUPS\n", __FUNCTION__, ptCtx->iIfaceNum, nResp);
-                
-                if (nResp > 0) {
-                    if (write_all(iEpIn, pcBuf, (size_t)nResp) < 0) {
-                        LogPrintf("%s: IF%d write ep_in: %s\n", __FUNCTION__, ptCtx->iIfaceNum, strerror(errno));
-                    }
-                    LogPrintf("%s: IF%d wrote %zd bytes to ep_in\n", __FUNCTION__, ptCtx->iIfaceNum, nResp);
-                }
+            pthread_t cups_thread;
+            if (pthread_create(&cups_thread, NULL, ep_cups_worker_thread, cups_ctx) == 0) {
+                pthread_detach(cups_thread); /* fire-and-forget; thread frees cups_ctx */
+                LogPrintf("%s: IF%d spawned CUPS worker thread\n", __FUNCTION__, ptCtx->iIfaceNum);
+            } else {
+                LogPrintf("%s: IF%d failed to create CUPS thread: %s\n",
+                          __FUNCTION__, ptCtx->iIfaceNum, strerror(errno));
+                free(cups_ctx);
             }
-
-            LogPrintf("%s: IF%d close CUPS connection\n", __FUNCTION__, ptCtx->iIfaceNum);
-            if (iCupsFd >= 0) { close(iCupsFd); iCupsFd = -1; }
         }
     }
 
     LogPrintf("%s: IF%d worker thread exiting\n", __FUNCTION__, ptCtx->iIfaceNum);
-
-    if (iEpIn   >= 0) close(iEpIn);
-    if (iEpOut  >= 0) close(iEpOut);
-    if (iCupsFd >= 0) close(iCupsFd);
-    free(pcBuf);
 
     return ptr;
 }
@@ -527,29 +649,39 @@ void *ep0_worker_thread(void *ptr)
         {
             if (errno == EINTR)
             {
-                LogPrintf("%s: poll interrupted by signal, continuing\n", __FUNCTION__);
                 continue;
             }
             LogPrintf("%s: poll error: %s\n", __FUNCTION__, strerror(errno));
             break;
         }
 
+        if (iRv == 0)
+        {
+            continue;
+        }
+
         if (sFds[0].revents & POLL_IN) {
-            iRv = process_ep0_event(iEp0);
-            if (iRv == 1)
-            {
-                g_ctx.fds_ready = 1;
-            } 
-            else if (iRv == -2)
-            {
-                g_ctx.fds_ready = 0;
-            }
-            else if (iRv < 0)
-            {
-                break;
+            const ep0_event_type_t event = process_ep0_event(iEp0);
+            switch(event) {
+                case EP0_EVENT_SETUP:
+                case EP0_EVENT_OK:
+                    break;
+                case EP0_EVENT_FDS_READY:
+                    g_ctx.fds_ready = 1;
+                    break;
+                case EP0_EVENT_FDS_NOT_READY:
+                    g_ctx.fds_ready = 0;
+                    break;
+                case EP0_EVENT_ERROR:
+                    LogPrintf("%s: fatal ep0 event %d\n", __FUNCTION__, event);
+                    goto exit;
+                default:
+                    LogPrintf("%s: unknown ep0 event type %d\n", __FUNCTION__, event);
+                    goto exit;
             }
         }    
     }
+    goto exit;
 
     exit:
         close(iEp0);
@@ -568,8 +700,17 @@ int main(int argc, char *argv[])
 
     LogPrintf("%s: starting usb-gadget, using FunctionFS directory '%s'\n", __FUNCTION__, dir);
 
-    signal(SIGINT,  on_signal);
-    signal(SIGTERM, on_signal);
+    /* Use sigaction() without SA_RESTART so that any blocking syscall
+     * (read, poll, write, …) returns EINTR immediately when a signal is
+     * delivered to that thread — allowing all worker threads to notice
+     * g_ctx.running == 0 and exit without waiting for a USB timeout. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_signal;
+    sigemptyset(&sa.sa_mask);
+    /* sa.sa_flags = 0 intentionally: no SA_RESTART */
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
 
     char acEp0Path[256], ep1_path[256], ep2_path[256], ep3_path[256],
@@ -636,6 +777,15 @@ int main(int argc, char *argv[])
     }
 
     pthread_join(ep0_thread, NULL);
+
+    /* ep0 exiting means g_ctx.running == 0. Worker threads may be blocked
+     * in poll() on FunctionFS endpoints that never return a timeout — send
+     * SIGTERM directly to each thread so poll() returns EINTR, the thread
+     * re-checks g_ctx.running and exits cleanly. */
+    pthread_kill(ep1_thread, SIGTERM);
+    pthread_kill(ep2_thread, SIGTERM);
+    pthread_kill(ep3_thread, SIGTERM);
+
     pthread_join(ep1_thread, NULL);
     pthread_join(ep2_thread, NULL);
     pthread_join(ep3_thread, NULL);
