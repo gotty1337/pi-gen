@@ -1,0 +1,6 @@
+#!/bin/sh
+OUTDIR="/home/pi/PDF"
+for last; do true; done
+STEM=$(basename "$last" .pdf)
+cat "$last"
+mv -f "$OUTDIR/${STEM}.prn" "$OUTDIR/${STEM}.pdf" 2>/dev/null || true

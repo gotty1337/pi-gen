@@ -6,10 +6,12 @@ After=network.target
 Type=simple
 User=pi
 ExecStart=/usr/sbin/ippeveprinter \
-    -K /dev/null \
+    -v \
+    -k \
     -D file:///home/pi/PDF \
     -p 8631 \
-    -f application/pdf,image/pwg-raster,image/urf,application/octet-stream \
+    -f application/pdf,image/pwg-raster,image/urf \
+    -c /usr/local/bin/ipp-save \
     USB-IPP-Printer
 Restart=on-failure
 RestartSec=3

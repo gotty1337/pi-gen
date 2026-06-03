@@ -43,6 +43,7 @@
 #define IPP_SERVER_HOST     "127.0.0.1"
 #define IPP_SERVER_PORT     8631
 #define CUPS_BUF_SIZE       (64 * 1024)  /* 64 KiB I/O chunks */
+#define IPP_RESP_POLL_MS    5            /* per-chunk inline response poll timeout */
 
 /*
  * IEEE 1284 Device ID string.  CMD:IPP is what triggers Windows' built-in
@@ -241,21 +242,6 @@ typedef struct {
     const char *acEpOutPath;
 } ep_worker_ctx_t;
 
-/*
- * Worker thread to handle writes from ep_out to CUPS and responses back to ep_in.
- * This allows us to keep the CUPS connection open across multiple requests and
- * avoid the overhead of reconnecting for each request.
- */
-typedef struct {
-    /* Interface number for logging purposes */
-    int iIfaceNum;
-    /* Paths for the IN and OUT endpoints of this interface */
-    const char *acEpInPath;
-    /* Read buffer */
-    char *pacRead;
-    /* Number of bytes read into pacRead */
-    ssize_t nRead;
-} ep_cups_worker_ctx_t;
 
 /*
  * Simple logging helper.
@@ -443,90 +429,24 @@ static int connect_to_ipp_server(int iIfaceNum)
     return iFd;
 }
 
-void *ep_cups_worker_thread(void *ptr) {
-    if (ptr == NULL) {
-        LogPrintf("%s: invalid context\n", __FUNCTION__);
-        return ptr;
-    }
-
-    ep_cups_worker_ctx_t *ptCtx = (ep_cups_worker_ctx_t *)ptr;
-
-    LogPrintf("%s: IF%d write worker thread started\n", __FUNCTION__, ptCtx->iIfaceNum);
-
-    int iCupsFd = connect_to_ipp_server(ptCtx->iIfaceNum);
-    if (iCupsFd < 0) {
-        LogPrintf("%s: IF%d could not connect to IPP server, dropping %zd bytes\n", __FUNCTION__, ptCtx->iIfaceNum, ptCtx->nRead);
-        goto exit;
-    }
-
-    LogPrintf("%s: IF%d connected to IPP server successfully\n", __FUNCTION__, ptCtx->iIfaceNum);
-
-    if (write_all(iCupsFd, ptCtx->pacRead, (size_t)ptCtx->nRead) < 0) {
-        LogPrintf("%s: IF%d write to IPP server failed: %s\n", __FUNCTION__, ptCtx->iIfaceNum, strerror(errno));
-        close(iCupsFd); iCupsFd = -1;
-        goto exit;
-    }
-    shutdown(iCupsFd, SHUT_WR);  /* signal EOF to server; we still read the response */
-
-    LogPrintf("%s: IF%d forwarded %zd bytes to IPP server\n", __FUNCTION__, ptCtx->iIfaceNum, ptCtx->nRead);
-
-    /* Read the full response.  ippeveprinter (like CUPS) may deliver headers
-     * and body in separate TCP writes, so loop until the server closes the
-     * connection.  Use a 5 s timeout per chunk — matching ipp-usb's deadline. */
-    size_t nRespTotal = 0;
-    char  *pRespBuf   = NULL;
-    for (;;) {
-        struct pollfd sCupsPfd = { .fd = iCupsFd, .events = POLLIN | POLLERR | POLLHUP | POLLNVAL };
-        int iRv = poll(&sCupsPfd, 1, 5000);
-        if (iRv <= 0) {
-            LogPrintf("%s: IF%d poll IPP response: %s\n", __FUNCTION__, ptCtx->iIfaceNum, (iRv < 0) ? strerror(errno) : "timeout");
-            break;
-        }
-        if (!(sCupsPfd.revents & POLLIN)) break;
-
-        char *pNewBuf = realloc(pRespBuf, nRespTotal + CUPS_BUF_SIZE);
-        if (!pNewBuf) {
-            LogPrintf("%s: IF%d realloc failed\n", __FUNCTION__, ptCtx->iIfaceNum);
-            break;
-        }
-        pRespBuf = pNewBuf;
-
-        ssize_t nChunk = read(iCupsFd, pRespBuf + nRespTotal, CUPS_BUF_SIZE);
-        if (nChunk <= 0) break;  /* EOF or error */
-        nRespTotal += (size_t)nChunk;
-    }
-
-    LogPrintf("%s: IF%d read %zu bytes from IPP server\n", __FUNCTION__, ptCtx->iIfaceNum, nRespTotal);
-
-    if (nRespTotal > 0 && pRespBuf) {
-        const int iEpIn = open(ptCtx->acEpInPath, O_RDWR | O_NONBLOCK);
-        if (iEpIn > 0) {
-            LogPrintf("%s: IF%d ep in opened successfully\n", __FUNCTION__, ptCtx->iIfaceNum);
-            if (write_all(iEpIn, pRespBuf, nRespTotal) < 0) {
-                LogPrintf("%s: IF%d write ep_in: %s\n", __FUNCTION__, ptCtx->iIfaceNum, strerror(errno));
-            } else {
-                LogPrintf("%s: IF%d wrote %zu bytes to ep_in\n", __FUNCTION__, ptCtx->iIfaceNum, nRespTotal);
-            }
-            close(iEpIn);
-        } else {
-            LogPrintf("%s: IF%d failed to open ep_in for writing response: %s\n", __FUNCTION__, ptCtx->iIfaceNum, strerror(errno));
-        }
-    }
-    free(pRespBuf);
-
-    LogPrintf("%s: IF%d close IPP server connection\n", __FUNCTION__, ptCtx->iIfaceNum);
-    if (iCupsFd >= 0) { close(iCupsFd); iCupsFd = -1; }
-    goto exit;
-
-    exit:
-        LogPrintf("%s: IF%d write worker thread exiting\n", __FUNCTION__, ptCtx->iIfaceNum);
-        free(ptCtx->pacRead);
-        ptCtx->pacRead = NULL;
-        ptCtx->nRead = 0;
-        free(ptCtx);
-        return ptr;
-}
-
+/*
+ * ep_worker_thread - Persistent bidirectional proxy between a USB FunctionFS
+ * bulk endpoint pair and the local ippeveprinter TCP server.
+ *
+ * Previous design: each read() from ep_out spawned a separate worker thread
+ * that opened a fresh TCP connection, wrote the chunk, called shutdown(SHUT_WR),
+ * and closed.  This broke large IPP requests (e.g. Send-Document) because the
+ * print data arrives as many consecutive USB bulk transfers (~32 KiB each),
+ * and each one was sent as a standalone, incomplete HTTP POST body.
+ * ippeveprinter received no valid request body and returned 0 bytes every time.
+ *
+ * New design: one persistent TCP connection per interface.  The event loop
+ * polls both ep_out and the TCP socket; USB data is forwarded to TCP without
+ * ever calling shutdown, and TCP response data is forwarded back to ep_in.
+ * The TCP connection is only closed when the server closes it (after it has
+ * finished sending a complete HTTP response), at which point we transparently
+ * reconnect before the next request chunk arrives.
+ */
 void *ep_worker_thread(void *ptr) {
     if (ptr == NULL) {
         LogPrintf("%s: invalid context\n", __FUNCTION__);
@@ -542,87 +462,270 @@ void *ep_worker_thread(void *ptr) {
         return ptr;
     }
 
-    int iEpOut = -1;
+    int iEpOut  = -1;
+    int iEpIn   = -1;
+    int iCupsFd = -1;
+    char aBuf[CUPS_BUF_SIZE];
 
     while (g_ctx.running) {
+        /* Wait for USB endpoints to be activated (ENABLE event on ep0). */
         if (!g_ctx.fds_ready) {
-            if (iEpOut >= 0) { close(iEpOut); iEpOut = -1; }
-            usleep(100000); /* 100ms */
+            if (iEpOut  >= 0) { close(iEpOut);  iEpOut  = -1; }
+            if (iEpIn   >= 0) { close(iEpIn);   iEpIn   = -1; }
+            if (iCupsFd >= 0) { close(iCupsFd); iCupsFd = -1; }
+            usleep(100000);
             continue;
         }
 
         if (iEpOut < 0) {
-            iEpOut = open(ptCtx->acEpOutPath, O_RDWR | O_NONBLOCK);
+            iEpOut = open(ptCtx->acEpOutPath, O_RDWR);
             if (iEpOut < 0) {
-                LogPrintf("%s: IF%d failed to open OUT endpoint: %s\n", __FUNCTION__, ptCtx->iIfaceNum, strerror(errno));
-                usleep(10000); /* 10ms before retry to avoid tight spin */
+                LogPrintf("%s: IF%d failed to open OUT endpoint: %s\n",
+                          __FUNCTION__, ptCtx->iIfaceNum, strerror(errno));
+                usleep(10000);
                 continue;
             }
             LogPrintf("%s: IF%d ep out opened successfully\n", __FUNCTION__, ptCtx->iIfaceNum);
         }
 
-        struct pollfd sFd = { .fd = iEpOut, .events = POLLIN | POLLERR | POLLHUP | POLLNVAL };
-        int iRv = poll(&sFd, 1, 100);
+        if (iEpIn < 0) {
+            iEpIn = open(ptCtx->acEpInPath, O_RDWR);
+            if (iEpIn < 0) {
+                LogPrintf("%s: IF%d failed to open IN endpoint: %s\n",
+                          __FUNCTION__, ptCtx->iIfaceNum, strerror(errno));
+                usleep(10000);
+                continue;
+            }
+            LogPrintf("%s: IF%d ep in opened successfully\n", __FUNCTION__, ptCtx->iIfaceNum);
+        }
+
+        if (iCupsFd < 0) {
+            iCupsFd = connect_to_ipp_server(ptCtx->iIfaceNum);
+            if (iCupsFd < 0) {
+                usleep(10000);
+                continue;
+            }
+            LogPrintf("%s: IF%d connected to IPP server\n", __FUNCTION__, ptCtx->iIfaceNum);
+        }
+
+        /*
+         * Poll both directions simultaneously:
+         *   sFds[0] = ep_out  (USB host → us → IPP server)
+         *   sFds[1] = iCupsFd (IPP server → us → USB host)
+         */
+        struct pollfd sFds[2] = {
+            { .fd = iEpOut,  .events = POLLIN | POLLERR | POLLHUP | POLLNVAL },
+            { .fd = iCupsFd, .events = POLLIN | POLLERR | POLLHUP },
+        };
+
+        int iRv = poll(sFds, 2, 100);
         if (iRv < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
+            if (errno == EINTR) continue;
             LogPrintf("%s: IF%d poll error: %s\n", __FUNCTION__, ptCtx->iIfaceNum, strerror(errno));
-            close(iEpOut); iEpOut = -1;
+            close(iEpOut);  iEpOut  = -1;
+            close(iEpIn);   iEpIn   = -1;
+            close(iCupsFd); iCupsFd = -1;
             continue;
         }
 
-        if (iRv == 0) {
-            LogPrintf("%s: IF%d poll timeout, no data on ep_out\n", __FUNCTION__, ptCtx->iIfaceNum);
-            continue;
-        }
-
-        if (sFd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+        /* ep_out endpoint errors → reset everything and re-open. */
+        if (sFds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
             LogPrintf("%s: IF%d ep_out error/hangup (revents=0x%x), closing\n",
-                      __FUNCTION__, ptCtx->iIfaceNum, sFd.revents);
-            close(iEpOut); iEpOut = -1;
+                      __FUNCTION__, ptCtx->iIfaceNum, sFds[0].revents);
+            close(iEpOut);  iEpOut  = -1;
+            close(iEpIn);   iEpIn   = -1;
+            close(iCupsFd); iCupsFd = -1;
             continue;
         }
 
-        /* ep_out → CUPS → ep_in: full request/response cycle */
-        if (sFd.revents & POLLIN) {
-            char acBuf[CUPS_BUF_SIZE] = {};
-            ssize_t nRead = read(iEpOut, acBuf, CUPS_BUF_SIZE);
-            if (nRead <= 0) {
-                if (nRead < 0 && errno != EAGAIN && errno != EINTR) {
-                    LogPrintf("%s: IF%d read ep_out: %s\n", __FUNCTION__, ptCtx->iIfaceNum, strerror(errno));
-                    close(iEpOut); iEpOut = -1;
-                }
+        /*
+         * TCP error/hangup: close and reconnect before next forward.
+         * But if POLLIN is also set (server sent its last response then closed),
+         * do NOT close yet — fall through to check_tcp to drain the response
+         * first.  Closing here would discard the response and hang the USB host.
+         */
+        if ((sFds[1].revents & POLLERR) ||
+            ((sFds[1].revents & POLLHUP) && !(sFds[1].revents & POLLIN))) {
+            LogPrintf("%s: IF%d IPP server connection lost, will reconnect\n",
+                      __FUNCTION__, ptCtx->iIfaceNum);
+            close(iCupsFd); iCupsFd = -1;
+            continue;
+        }
+
+        /* USB OUT → TCP: forward request data (one chunk) to IPP server.
+         * Do NOT call shutdown() here — more chunks may follow for the same
+         * HTTP POST request (e.g. a multi-packet Send-Document body). */
+        if (sFds[0].revents & POLLIN) {
+            ssize_t nRead = read(iEpOut, aBuf, sizeof(aBuf));
+            if (nRead < 0) {
+                if (errno == EAGAIN || errno == EINTR) goto check_tcp;
+                LogPrintf("%s: IF%d read ep_out: %s\n", __FUNCTION__, ptCtx->iIfaceNum, strerror(errno));
+                close(iEpOut);  iEpOut  = -1;
+                close(iEpIn);   iEpIn   = -1;
+                close(iCupsFd); iCupsFd = -1;
                 continue;
             }
+            if (nRead == 0) goto check_tcp;
 
             LogPrintf("%s: IF%d read %zd bytes from ep_out\n", __FUNCTION__, ptCtx->iIfaceNum, nRead);
 
-            ep_cups_worker_ctx_t *cups_ctx = malloc(sizeof(ep_cups_worker_ctx_t));
-            if (!cups_ctx) {
-                LogPrintf("%s: IF%d malloc cups_ctx failed\n", __FUNCTION__, ptCtx->iIfaceNum);
+            /* Reconnect if TCP was closed after the previous response. */
+            if (iCupsFd < 0) {
+                iCupsFd = connect_to_ipp_server(ptCtx->iIfaceNum);
+                if (iCupsFd < 0) {
+                    LogPrintf("%s: IF%d reconnect failed, dropping %zd bytes\n",
+                              __FUNCTION__, ptCtx->iIfaceNum, nRead);
+                    goto check_tcp;
+                }
+                LogPrintf("%s: IF%d reconnected to IPP server\n", __FUNCTION__, ptCtx->iIfaceNum);
+            }
+
+            /*
+             * Pre-write health check: ippeveprinter closes idle connections after
+             * its keep-alive timeout (~10s).  The FIN may have arrived between our
+             * last poll() and now, so the outer poll()'s TCP revents are stale.
+             * A 0-ms poll catches this race without blocking.
+             *
+             * On Linux a CLOSE_WAIT socket (remote FIN received, no pending data)
+             * sets POLLIN|POLLHUP together.  We use MSG_PEEK to distinguish EOF
+             * (recv returns 0) from actual data (recv returns >0).
+             */
+            {
+                struct pollfd sChk = { .fd = iCupsFd,
+                                       .events = POLLIN | POLLERR | POLLHUP };
+                int bStale = 0;
+                if (poll(&sChk, 1, 0) > 0) {
+                    if (sChk.revents & POLLERR) {
+                        bStale = 1;
+                    } else if (sChk.revents & (POLLIN | POLLHUP)) {
+                        char cPeek;
+                        /* recv == 0 → EOF (remote closed), -1 → EAGAIN (spurious) */
+                        bStale = (recv(iCupsFd, &cPeek, 1, MSG_PEEK | MSG_DONTWAIT) == 0);
+                    }
+                }
+                if (bStale) {
+                    LogPrintf("%s: IF%d TCP stale connection detected, reconnecting\n",
+                              __FUNCTION__, ptCtx->iIfaceNum);
+                    close(iCupsFd);
+                    iCupsFd = connect_to_ipp_server(ptCtx->iIfaceNum);
+                    if (iCupsFd < 0) {
+                        LogPrintf("%s: IF%d reconnect failed after stale check\n",
+                                  __FUNCTION__, ptCtx->iIfaceNum);
+                        goto check_tcp;
+                    }
+                    LogPrintf("%s: IF%d reconnected to IPP server\n",
+                              __FUNCTION__, ptCtx->iIfaceNum);
+                }
+            }
+
+            if (write_all(iCupsFd, aBuf, (size_t)nRead) < 0) {
+                LogPrintf("%s: IF%d write to IPP server failed: %s\n",
+                          __FUNCTION__, ptCtx->iIfaceNum, strerror(errno));
+                close(iCupsFd); iCupsFd = -1;
+                goto check_tcp;
+            }
+            LogPrintf("%s: IF%d forwarded %zd bytes to IPP server\n", __FUNCTION__, ptCtx->iIfaceNum, nRead);
+
+            /*
+             * The outer poll() fired for ep_out BEFORE we wrote to TCP, so
+             * sFds[1].revents does not yet reflect the server's response.
+             * Do a short inline poll on TCP to catch responses that arrive
+             * immediately (single-request operations like Get-Printer-Attributes).
+             * For multi-chunk requests (Send-Document) there is no response yet,
+             * so this times out quickly and the main loop handles it later.
+             */
+            while (iCupsFd >= 0 && iEpIn >= 0) {
+                struct pollfd sRsp = { .fd = iCupsFd,
+                                       .events = POLLIN | POLLERR | POLLHUP };
+                if (poll(&sRsp, 1, IPP_RESP_POLL_MS) <= 0) break;
+                /* POLLERR: fatal. POLLHUP alone (no POLLIN): no more data. */
+                if (sRsp.revents & POLLERR) {
+                    LogPrintf("%s: IF%d IPP server error (inline)\n",
+                              __FUNCTION__, ptCtx->iIfaceNum);
+                    close(iCupsFd); iCupsFd = -1;
+                    break;
+                }
+                if (!(sRsp.revents & POLLIN)) {
+                    /* POLLHUP without data — server closed after last response. */
+                    close(iCupsFd); iCupsFd = -1;
+                    break;
+                }
+                /* POLLIN (and possibly POLLHUP): drain the data first. */
+
+                ssize_t nResp = read(iCupsFd, aBuf, sizeof(aBuf));
+                if (nResp < 0) {
+                    if (errno == EAGAIN || errno == EINTR) continue;
+                    LogPrintf("%s: IF%d read IPP server (inline): %s\n",
+                              __FUNCTION__, ptCtx->iIfaceNum, strerror(errno));
+                    close(iCupsFd); iCupsFd = -1;
+                    break;
+                }
+                if (nResp == 0) {
+                    LogPrintf("%s: IF%d IPP server closed connection\n",
+                              __FUNCTION__, ptCtx->iIfaceNum);
+                    close(iCupsFd); iCupsFd = -1;
+                    break;
+                }
+                LogPrintf("%s: IF%d read %zd bytes from IPP server\n",
+                          __FUNCTION__, ptCtx->iIfaceNum, nResp);
+                if (write_all(iEpIn, aBuf, (size_t)nResp) < 0) {
+                    LogPrintf("%s: IF%d write ep_in failed: %s\n",
+                              __FUNCTION__, ptCtx->iIfaceNum, strerror(errno));
+                    close(iEpIn); iEpIn = -1;
+                    break;
+                }
+                LogPrintf("%s: IF%d wrote %zd bytes to ep_in\n",
+                          __FUNCTION__, ptCtx->iIfaceNum, nResp);
+            }
+
+            /*
+             * The inline drain may have consumed the data that caused the
+             * outer poll to set sFds[1].revents = POLLIN.  Clear it now so
+             * check_tcp below doesn't call blocking read() on an empty socket.
+             * Any data that actually arrived after the inline drain finished
+             * will be caught by the next outer poll() iteration.
+             */
+            sFds[1].revents = 0;
+        }
+
+    check_tcp:
+        /*
+         * TCP → USB IN: forward any response data not yet handled by the
+         * inline drain above (e.g. large responses, or responses that arrive
+         * only after multiple ep_out chunks have been forwarded).
+         */
+        if (iCupsFd >= 0 && (sFds[1].revents & POLLIN)) {
+            ssize_t nRead = read(iCupsFd, aBuf, sizeof(aBuf));
+            if (nRead < 0) {
+                if (errno == EAGAIN || errno == EINTR) continue;
+                LogPrintf("%s: IF%d read IPP server: %s\n", __FUNCTION__, ptCtx->iIfaceNum, strerror(errno));
+                close(iCupsFd); iCupsFd = -1;
                 continue;
             }
-            cups_ctx->iIfaceNum = ptCtx->iIfaceNum;
-            cups_ctx->acEpInPath = ptCtx->acEpInPath;
-            cups_ctx->pacRead = malloc((size_t)nRead);
-            memcpy(cups_ctx->pacRead, acBuf, (size_t)nRead);
-            cups_ctx->nRead = nRead;
-
-            pthread_t cups_thread;
-            if (pthread_create(&cups_thread, NULL, ep_cups_worker_thread, cups_ctx) == 0) {
-                pthread_detach(cups_thread); /* fire-and-forget; thread frees cups_ctx */
-                LogPrintf("%s: IF%d spawned CUPS worker thread\n", __FUNCTION__, ptCtx->iIfaceNum);
-            } else {
-                LogPrintf("%s: IF%d failed to create CUPS thread: %s\n",
-                          __FUNCTION__, ptCtx->iIfaceNum, strerror(errno));
-                free(cups_ctx);
+            if (nRead == 0) {
+                /* Server closed connection — full response has been received. */
+                LogPrintf("%s: IF%d IPP server closed connection\n", __FUNCTION__, ptCtx->iIfaceNum);
+                close(iCupsFd); iCupsFd = -1;
+                continue;
             }
+
+            LogPrintf("%s: IF%d read %zd bytes from IPP server\n", __FUNCTION__, ptCtx->iIfaceNum, nRead);
+
+            if (iEpIn >= 0 && write_all(iEpIn, aBuf, (size_t)nRead) < 0) {
+                LogPrintf("%s: IF%d write ep_in failed: %s\n", __FUNCTION__, ptCtx->iIfaceNum, strerror(errno));
+                close(iEpIn); iEpIn = -1;
+                continue;
+            }
+            if (iEpIn >= 0)
+                LogPrintf("%s: IF%d wrote %zd bytes to ep_in\n", __FUNCTION__, ptCtx->iIfaceNum, nRead);
         }
     }
 
-    LogPrintf("%s: IF%d worker thread exiting\n", __FUNCTION__, ptCtx->iIfaceNum);
+    if (iEpOut  >= 0) close(iEpOut);
+    if (iEpIn   >= 0) close(iEpIn);
+    if (iCupsFd >= 0) close(iCupsFd);
 
+    LogPrintf("%s: IF%d worker thread exiting\n", __FUNCTION__, ptCtx->iIfaceNum);
     return ptr;
 }
 

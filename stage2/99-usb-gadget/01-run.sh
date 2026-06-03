@@ -18,6 +18,8 @@ install -m 644 "${FILES}/usb-gadget.service" \
     "${ROOTFS_DIR}/etc/systemd/system/usb-gadget.service"
 install -m 644 "${FILES}/ipp-printer.service" \
     "${ROOTFS_DIR}/etc/systemd/system/ipp-printer.service"
+install -m 755 "${FILES}/ipp-save" \
+    "${ROOTFS_DIR}/usr/local/bin/ipp-save"
 
 # Configure the dwc2 USB controller for peripheral (device) mode.
 # Remove any conflicting host or OTG-mode entries first, then append the
