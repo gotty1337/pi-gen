@@ -19,4 +19,13 @@ Only if needed for cross-compilation, e.g. when building on a non-ARM64 host.
 
 ```powershell
 docker run --privileged --rm tonistiigi/binfmt --install arm,arm64
- ```
+```
+
+## Host System Settings
+
+I needed some few commands to not raise errors due to not support formats... The `ippeveprinter` with the `usb-gadget` supports PDF.
+
+```bash
+lpadmin -p USB-IPP-Printer -E  -v ipp://localhost:60000/ipp/print -m everywhere
+lpadmin -p USB-IPP-Printer -o document-format=application/pdf
+```
