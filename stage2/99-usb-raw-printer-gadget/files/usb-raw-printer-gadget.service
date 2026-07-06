@@ -1,0 +1,23 @@
+[Unit]
+Description=Raw USB Printer Gadget
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# Set up configfs gadget structure and bind it to the UDC. The kernel's
+# usb_f_printer function handles all USB protocol details; received
+# print data is available directly at /dev/usb/lp0.
+ExecStart=/home/pi/usb-raw-printer-gadget/gadget_setup.sh
+
+# On stop, detach UDC and clean up configfs.
+ExecStop=/home/pi/usb-raw-printer-gadget/gadget_teardown.sh
+
+Restart=on-failure
+RestartSec=5
+
+# Note: not enabled at boot. Start manually with:
+#   sudo systemctl start usb-raw-printer-gadget.service
+[Install]
+WantedBy=multi-user.target
